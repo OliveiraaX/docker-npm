@@ -1,160 +1,203 @@
-import { Injectable } from '@nestjs/common';
+// src/docker/docker.service.ts
+import { Injectable, Logger } from '@nestjs/common';
 import { Docker } from 'node-docker-api';
-import { Readable } from 'stream';
 
-export interface ContainerInfo {
+export interface ContainerSummary {
     id: string;
     name: string;
     image: string;
+    state: string;
     status: string;
-    logs: string[];
-    client: string;
-    imageUpdatedAt: string | null;
-    number: string | null;
+    inspectData: any;
+    running: boolean;
 }
-
+export interface ContainerUsage {
+    id: string;
+    image: string;
+    state: string;
+    createdAt: string;
+    cpuPercent: string;
+    memoryUsage: string;
+    memoryLimit: string;
+    memoryPercent: string;
+    lastLogs: string[];
+}
 
 @Injectable()
 export class DockerService {
+    private readonly logger = new Logger(DockerService.name);
     private docker: Docker;
 
     constructor() {
         this.docker = new Docker({
+            protocol: 'http',
+            port: 2375,
         });
     }
 
-    webhookExtract(logs: string[]): string {
-        for (const log of logs) {
-            const urlMatch = log.match(/https?:\/\/([a-zA-Z0-9-]+)\.[^/\s'"]+/);
-            if (urlMatch && urlMatch[1]) {
-                const subdomain = urlMatch[1];
-                return subdomain.charAt(0).toUpperCase() + subdomain.slice(1);
-            }
+    async listContainers(): Promise<ContainerSummary[]> {
+        const containers: any[] = await this.docker.container.list({ all: true });
+
+        const results = await Promise.all(
+            containers.map(async (ce: any) => {
+                try {
+                    const status = await ce.status();
+                    const info = status.data as any;
+
+                    // nome
+                    const rawNames: string[] | undefined = info.Names;
+                    const name = rawNames && rawNames.length > 0
+                        ? rawNames[0].replace(/^\//, '')
+                        : info.Name?.replace(/^\//, '') ?? 'sem-nome';
+
+                    // pegar último log
+                    let lastLogLine = '';
+                    try {
+                        const logStream = await ce.logs({
+                            stdout: true,
+                            stderr: true,
+                            tail: 1,
+                        });
+                        const logStr = await this.streamToString(logStream as NodeJS.ReadableStream);
+                        const lines = logStr.split('\n').filter(l => l.trim() !== '');
+                        if (lines.length > 0) {
+                            lastLogLine = lines[lines.length - 1];
+                        }
+                    } catch (err) {
+                        this.logger.warn(`Não foi possível obter último log do container ${info.Id}`, err);
+                    }
+
+                    // estado Docker
+                    const isDockerRunning = info.State?.Running === true;
+
+                    // log heurística
+                    let isLogRunning = false;
+                    let errorMessage: string | undefined = undefined;
+
+                    if (lastLogLine) {
+                        const txt = lastLogLine.toLowerCase();
+
+                        // Se detectar palavras de erro, marque erro explícito
+                        if (/(working in port|erro|error|fail|exception|qrreaderror)/.test(txt)) {
+                            errorMessage = lastLogLine;
+                            isLogRunning = false;
+                        } else {
+                            isLogRunning = true;
+                        }
+                    }
+
+                    // combine os dois
+                    const running = isDockerRunning && isLogRunning;
+
+                    return {
+                        id: info.Id,
+                        image: info.Config?.Image ?? info.Image ?? 'desconhecida',
+                        name,
+                        inspectData: info.Created,
+                        running,
+                    } as ContainerSummary;
+                } catch (err) {
+                    this.logger.error(`Erro inspecionando container`, err);
+                    return null;
+                }
+            }),
+        );
+
+        return results.filter((r): r is ContainerSummary => r !== null);
+    }
+
+    async getContainerSummary(id: string): Promise<ContainerUsage> {
+        const container: any = this.docker.container.get(id);
+        console.log('getContainerSummary')
+        let logsData: string[] = [];
+        try {
+            const logStream: any = await container.logs({
+                follow: false,
+                stdout: true,
+                stderr: true,
+                tail: 1,
+            });
+            const logsString = await this.streamToString(logStream as NodeJS.ReadableStream);
+            logsData = logsString.split('\n').filter(l => l.trim().length > 0);
+        } catch (err) {
+            this.logger.warn(`Não foi possível obter logs do container ${id}`, err);
         }
-        return 'Unknown';
-    }
 
-    cleanAnsi(str: string): string {
-        return str
-            .replace(/\u001b\[.*?m/g, '')
-            .replace(/\\u003E/g, '>')
-            .replace(/\\u003C/g, '<')
-            .replace(/\\u0026/g, '&')
-            .replace(/\u003E/g, '>');
-    }
+        let cpuPercent = '0%';
+        let memoryUsage = '0 MB';
+        let memoryLimit = '0 MB';
+        let memoryPercent = '0%';
+        let createdAt = new Date().toISOString();
+        let state = 'unknown';
+        let imageName = '';
 
-    private extractClientNumber(logs: string[]): string | null {
-        for (const log of logs) {
-            const match = log.match(/chatId:\s*'(\d+)@c\.us'/);
-            if (match && match[1]) {
-                return match[1];
+        try {
+            const statsStream: any = await container.stats({ stream: false });
+            const statsJson = await this.streamToJson(statsStream as NodeJS.ReadableStream);
+
+            const cpuDelta = statsJson.cpu_stats.cpu_usage.total_usage - statsJson.precpu_stats.cpu_usage.total_usage;
+            const systemDelta = statsJson.cpu_stats.system_cpu_usage - statsJson.precpu_stats.system_cpu_usage;
+            const onlineCPUs = statsJson.cpu_stats.online_cpus || 1;
+            const cpuPerc = systemDelta > 0
+                ? (cpuDelta / systemDelta) * onlineCPUs * 100
+                : 0;
+            cpuPercent = `${cpuPerc.toFixed(2)}%`;
+
+            const memUsage = statsJson.memory_stats.usage;
+            const memLimit = statsJson.memory_stats.limit;
+            memoryUsage = `${(memUsage / 1024 / 1024).toFixed(2)} MB`;
+            memoryLimit = `${(memLimit / 1024 / 1024).toFixed(2)} MB`;
+            memoryPercent = `${((memUsage / memLimit) * 100).toFixed(2)}%`;
+
+            imageName = statsJson.name ?? '';
+            if (statsJson.read) {
+                createdAt = new Date(statsJson.read).toISOString();
             }
+            state = statsJson.read ? 'running' : 'stopped';
+        } catch (err) {
+            this.logger.warn(`Erro obtendo estatísticas do container ${id}`, err);
         }
-        return null;
+
+        return {
+            id,
+            image: imageName,
+            state,
+            createdAt,
+            cpuPercent,
+            memoryUsage,
+            memoryLimit,
+            memoryPercent,
+            lastLogs: logsData,
+        };
     }
 
-    private async getLastLinesOfLogs(id: string, numLines: number): Promise<string> {
-        const container = this.docker.container.get(id);
-        const stream = await container.logs({
-            stdout: true,
-            stderr: true,
-            follow: false,
-            tail: 300,
-        }) as Readable;
-
-        const chunks: string[] = [];
+    private streamToString(stream: NodeJS.ReadableStream): Promise<string> {
         return new Promise((resolve, reject) => {
-            stream.on('data', (chunk) => {
-                chunks.push(chunk.toString('utf8'));
+            console.log('streamToString')
+            let data = '';
+            stream.on('data', chunk => {
+                data += chunk.toString('utf8');
+            });
+            stream.on('end', () => resolve(data));
+            stream.on('error', reject);
+        });
+    }
+
+    private streamToJson(stream: NodeJS.ReadableStream): Promise<any> {
+        return new Promise((resolve, reject) => {
+            console.log('streamToJson')
+            let data = '';
+            stream.on('data', chunk => {
+                data += chunk.toString('utf8');
             });
             stream.on('end', () => {
-                const full = chunks.join('');
-                const lines = full.split(/\r?\n/);
-                const cleaned = lines.map(line => line.replace(/^[\x00-\x1F]+/, ''));
-                const nonEmpty = cleaned.filter(l => l.trim().length > 0);
-                const last = nonEmpty.slice(-numLines);
-                resolve(last.join('\n'));
+                try {
+                    resolve(JSON.parse(data));
+                } catch (err) {
+                    reject(err);
+                }
             });
-            stream.on('error', err => reject(err));
+            stream.on('error', reject);
         });
     }
-
-    private async resolveImageDetails(imageId: string): Promise<{ name: string; updatedAt: Date | null }> {
-        try {
-            const image = this.docker.image.get(imageId);
-            const imageInfo = await image.status() as {
-                data: {
-                    RepoTags?: string[];
-                    Created?: string;
-                }
-            };
-
-            console.log('🖼️ imageInfo.data:', imageInfo.data);
-
-            const name = imageInfo.data.RepoTags?.[0] || imageId;
-
-            if (!imageInfo.data.Created) {
-                console.warn(`⚠️ Imagem ${name} sem campo "Created"`);
-            }
-
-            const created = imageInfo.data.Created ? new Date(imageInfo.data.Created) : null;
-
-            return {
-                name,
-                updatedAt: created,
-            };
-        } catch (err) {
-            console.warn(`Erro ao buscar info da imagem (${imageId}): ${err.message}`);
-            return {
-                name: imageId,
-                updatedAt: null,
-            };
-        }
-    }
-
-    async listContainersWithLogs(): Promise<ContainerInfo[]> {
-        const containers = await this.docker.container.list();
-        const result: ContainerInfo[] = [];
-
-        for (const cont of containers) {
-            const status = await cont.status();
-            const data: any = status.data;
-
-            let logs = '';
-            try {
-                logs = await this.getLastLinesOfLogs(data.Id, 20);
-            } catch (err) {
-                logs = `Erro ao obter logs: ${err.message || err}`;
-            }
-
-            const logsArray = logs
-                .split('\n')
-                .map(log => this.cleanAnsi(log));
-
-            const client = this.webhookExtract(logsArray);
-            const isWorkingInPort3001 = logs.includes('working in port 3001');
-            const containerStatus = isWorkingInPort3001 ? 'Não iniciado' : data.State?.Status || 'unknown';
-            const number = this.extractClientNumber(logsArray);
-            const imageDetails = await this.resolveImageDetails(data.Image);
-
-            const updatedAt = imageDetails.updatedAt;
-            const imageUpdatedAt = updatedAt instanceof Date && !isNaN(updatedAt.getTime())
-                ? updatedAt.toISOString()
-                : null;
-
-            result.push({
-                client: client || 'desconhecido',
-                number: number || 'desconhecido.',
-                id: data.Id,
-                name: data.name,
-                image: imageDetails.name,
-                imageUpdatedAt,
-                status: containerStatus,
-                logs: logsArray,
-            });
-        }
-
-        return result;
-    }
-
 }

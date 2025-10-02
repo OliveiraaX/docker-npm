@@ -1,6 +1,5 @@
 import { Module } from '@nestjs/common';
-import { DockerService } from './docker.service';
-import { DockerController } from './docker.controller';
+import { DockerController, DockerService } from './docker.controller';
 
 @Module({
     providers: [DockerService],
