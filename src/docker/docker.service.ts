@@ -2,6 +2,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { Docker } from 'node-docker-api';
 
+
 export interface ContainerSummary {
     id: string;
     name: string;
@@ -173,13 +174,14 @@ export class DockerService {
 
     private streamToString(stream: NodeJS.ReadableStream): Promise<string> {
         return new Promise((resolve, reject) => {
-            console.log('streamToString')
+            console.time('streamToString')
             let data = '';
             stream.on('data', chunk => {
                 data += chunk.toString('utf8');
             });
             stream.on('end', () => resolve(data));
             stream.on('error', reject);
+            console.timeEnd('streamToString');
         });
     }
 
